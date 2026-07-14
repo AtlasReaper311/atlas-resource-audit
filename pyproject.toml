@@ -1,0 +1,8 @@
+[project]
+name = "atlas-resource-audit"
+version = "1.0.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+atlas-resource-audit = "atlas_resource_audit.__main__:main"
