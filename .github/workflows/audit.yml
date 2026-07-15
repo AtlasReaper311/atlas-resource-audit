@@ -5,6 +5,11 @@ on:
     - cron: "23 7 * * 1"
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.repository }}-resource-audit-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   audit:
     runs-on: ubuntu-latest
