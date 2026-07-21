@@ -64,6 +64,10 @@ def reconcile(declared: dict[str, Any], observed: dict[str, Any]) -> dict[str, A
     privacy = observed.get("privacy")
     if not isinstance(privacy, dict) or privacy.get("raw_provider_payload_retained") is not False:
         raise TopologyAuditError("observed topology does not prove raw provider payload redaction")
+    if privacy.get("unexpected_route_identities_retained") is not False:
+        raise TopologyAuditError("observed topology may retain unexpected route identities")
+    if privacy.get("unexpected_binding_identities_retained") is not False:
+        raise TopologyAuditError("observed topology may retain unexpected binding identities")
 
     declared_workers = {
         worker["script_name"]: worker
@@ -104,14 +108,14 @@ def reconcile(declared: dict[str, Any], observed: dict[str, Any]) -> dict[str, A
                 route for route in actual.get("routes", []) if isinstance(route, str)
             }
             missing_routes = sorted(expected_routes - observed_routes)
-            unexpected_routes = sorted(observed_routes - expected_routes)
-            if missing_routes or unexpected_routes:
+            unexpected_route_count = int(actual.get("unexpected_route_count", 0) or 0)
+            if missing_routes or unexpected_route_count:
                 state = "failed"
                 add(
                     "error",
                     "route-owner-drift",
                     script,
-                    f"Route ownership differs from declaration: {len(missing_routes)} missing, {len(unexpected_routes)} unexpected.",
+                    f"Route ownership differs from declaration: {len(missing_routes)} missing, {unexpected_route_count} unexpected identities redacted.",
                 )
 
             if actual.get("bindings_state") != "observed":
@@ -125,11 +129,29 @@ def reconcile(declared: dict[str, Any], observed: dict[str, Any]) -> dict[str, A
                     state = "failed"
                     finding_type = "missing-service-binding" if kind == "service" else "missing-storage"
                     add("error", finding_type, script, f"Expected {kind} binding {name} to {target} was not observed.")
-                for kind, name, target in sorted(actual_bindings - expected_bindings):
+                unexpected_counts = actual.get("unexpected_binding_counts") or {}
+                if not isinstance(unexpected_counts, dict):
+                    raise TopologyAuditError(f"{script}: unexpected_binding_counts must be an object")
+                unexpected_services = int(unexpected_counts.get("service", 0) or 0)
+                unexpected_storage = int(unexpected_counts.get("storage", 0) or 0)
+                if unexpected_services:
                     if state == "healthy":
                         state = "warning"
-                    finding_type = "unexpected-service-binding" if kind == "service" else "orphaned-storage"
-                    add("warning", finding_type, script, f"Unexpected {kind} binding {name} to {target} was observed on a declared public Worker.")
+                    add(
+                        "warning",
+                        "unexpected-service-binding",
+                        script,
+                        f"Observed {unexpected_services} undeclared service binding(s); identities are redacted.",
+                    )
+                if unexpected_storage:
+                    if state == "healthy":
+                        state = "warning"
+                    add(
+                        "warning",
+                        "orphaned-storage",
+                        script,
+                        f"Observed {unexpected_storage} undeclared storage binding(s); identities are redacted.",
+                    )
 
             metadata = actual.get("metadata")
             if not isinstance(metadata, dict) or metadata.get("state") != "observed":
@@ -198,6 +220,8 @@ def reconcile(declared: dict[str, Any], observed: dict[str, Any]) -> dict[str, A
         "privacy": {
             "model": "declared-public-identities-plus-aggregate-undeclared-counts",
             "undeclared_identities_redacted": True,
+            "unexpected_route_identities_redacted": True,
+            "unexpected_binding_identities_redacted": True,
         },
         "summary": {
             "declared_workers": len(worker_results),
