@@ -7,7 +7,7 @@
 ```
 ┌─────────────────────────────────────────────┐
 │  ATLAS SYSTEMS // atlas-resource-audit      │
-│  reconcile public cloudflare storage        │
+│  reconcile public cloudflare topology       │
 │  without exposing private account state     │
 └─────────────────────────────────────────────┘
 ```
@@ -17,52 +17,54 @@
 ![Boundary](https://img.shields.io/badge/provider-read--only-aaa9a0?style=flat-square&labelColor=0a0a0f)
 ![Cost](https://img.shields.io/badge/cost-%C2%A30-aaa9a0?style=flat-square&labelColor=0a0a0f)
 
-Read-only desired-state versus observed-state reconciliation for the public Cloudflare storage owned by Atlas Systems. The auditor consumes the canonical public declaration from `atlas-infra`, performs minimum-identity provider reads, and reports missing declared resources without publishing the identities of undeclared account resources that may be private.
+Read-only desired-state versus observed-state reconciliation for public Cloudflare storage and runtime topology owned by Atlas Systems. The auditor consumes canonical declarations from `atlas-infra`, performs minimum-identity provider reads, and reports missing or drifting declared resources without publishing the identities of undeclared account objects that may be private.
 
 ## The problem it solves
 
-Cloudflare account discovery can see more than the public Atlas Systems estate. Treating every observed resource as public, or treating every undeclared resource as orphaned, would collapse the public/private boundary and could publish private infrastructure by accident.
+Cloudflare account discovery can see more than the public Atlas Systems estate. Treating every observed object as public, or treating every undeclared object as orphaned, would collapse the public/private boundary and could publish private infrastructure by accident.
 
 The audit therefore separates two questions:
 
-1. Is every resource intentionally declared as public still present in Cloudflare?
-2. How many additional resources were observed by kind, without exposing who or what they belong to?
+1. Is every resource intentionally declared as public still present and wired as expected in Cloudflare?
+2. How many additional provider objects were observed, without exposing who or what they belong to?
 
-A declared resource that disappears is a failure. An undeclared provider resource is aggregate-only evidence and does not become a public identity merely because the read token can see it.
+A declared resource that disappears or changes ownership is a finding. An undeclared provider object is aggregate-only evidence and does not become a public identity merely because the read token can see it.
 
 ## Authority and data flow
 
-The desired-state authority is:
+The desired-state authorities are:
 
 ```text
 AtlasReaper311/atlas-infra
   policy/public-cloudflare-resources.json
+  policy/public-cloudflare-topology.json
 ```
 
-That file declares public KV, D1, and R2 resources by `(kind, provider_id)`, with exactly one public owner and optional consumers. `atlas-resource-audit` does not maintain a second desired-state copy.
+The resource policy owns public KV, D1, and R2 identities. The topology policy owns the explicit public allowlist for Worker scripts, routes, service bindings, metadata endpoints, and Pages projects. `atlas-resource-audit` does not maintain a second desired-state copy.
 
-The scheduled flow is:
+The retained evidence flow is:
 
 ```text
-atlas-infra public resource policy
+atlas-infra public declarations
               │
               ▼
     atlas-resource-audit
               │
               ├── read-only Cloudflare observation
-              │      kind + provider_id only
               │
-              ├── exact declared-resource reconciliation
+              ├── immediate privacy reduction
               │
-              └── sanitized JSON + Markdown report
+              ├── deterministic reconciliation
+              │
+              └── sanitized JSON + Markdown reports
                      │
                      ├── declared public identities
                      └── undeclared aggregate counts only
 ```
 
-The raw Cloudflare observation is written under the GitHub runner temporary directory and removed at step exit. It is never uploaded as an artifact.
+Raw provider responses are never uploaded as artifacts. Topology settings are reduced in memory before output, and secret-bearing Worker binding values are not part of the retained topology schema.
 
-## Scheduled audit
+## Scheduled storage audit
 
 `.github/workflows/audit.yml` runs every Monday at `07:41 UTC` and can also be started manually.
 
@@ -71,7 +73,7 @@ The job:
 1. checks out this repository;
 2. checks out `atlas-infra/main` read-only;
 3. compiles and tests the deterministic audit engine;
-4. reads the Cloudflare account ID from the canonical public policy;
+4. reads the Cloudflare account ID from the canonical public resource policy;
 5. collects KV, D1, and R2 identities using a read-only token;
 6. reconciles the observed identities against the public declaration;
 7. appends the sanitized Markdown report to the workflow summary;
@@ -83,7 +85,7 @@ The workflow needs one GitHub Actions secret name:
 CF_RESOURCE_AUDIT_READ_TOKEN
 ```
 
-The value is never committed or passed through chat. The Cloudflare token should grant only the account-level permissions needed by the collector: `Workers KV Storage Read`, `D1 Read`, and `Workers R2 Storage Read`. It does not need Worker deployment, route mutation, DNS mutation, storage write, or delete permissions.
+The value is never committed or passed through chat. The existing storage audit requires only the account-level permissions needed for KV, D1, and R2 reads. It does not need Worker deployment, route mutation, DNS mutation, storage write, or delete permissions.
 
 If the secret is absent, the live step fails closed with an explicit configuration error rather than running a fixture-only audit and presenting it as live evidence.
 
@@ -104,7 +106,7 @@ python3 -m compileall -q atlas_resource_audit tests
 python3 -m unittest discover -s tests -v
 ```
 
-For an operator collection, check out `atlas-infra` beside this repository and derive the public account ID from policy:
+For an operator storage collection, check out `atlas-infra` beside this repository and derive the public account ID from policy:
 
 ```bash
 export CLOUDFLARE_ACCOUNT_ID="$(python3 -c 'import json; print(json.load(open("../atlas-infra/policy/public-cloudflare-resources.json", encoding="utf-8"))["account_id"])')"
@@ -116,7 +118,7 @@ python3 -m atlas_resource_audit.cloudflare_collect \
 
 Supply `CLOUDFLARE_API_TOKEN` through the approved local secret-injection method before running that command. Do not place the token in source, shell history, command arguments, chat, or issue text.
 
-Run reconciliation against the checked-out Atlas Infra policy:
+Run storage reconciliation:
 
 ```bash
 python3 -m atlas_resource_audit \
@@ -128,26 +130,53 @@ python3 -m atlas_resource_audit \
 
 Delete the raw observed file after the run. Only the sanitized reports are suitable for publication or artifact retention.
 
+## Live topology reconciliation
+
+`.github/workflows/topology-audit.yml` is deliberately manual-only. Merging the source does not start a provider read.
+
+The topology collector reads the exact public declaration from the merged Atlas Infra authority and observes:
+
+- deployed Worker script existence;
+- Worker routes;
+- service and declared storage bindings for declared public Workers;
+- the bounded public `/_meta` identity for declared Workers;
+- declared public Cloudflare Pages projects.
+
+Account-wide Worker, route, and Pages discovery is reduced before retention. Undeclared Worker names, route patterns, Pages project names, and binding identities never enter the sanitized observation or final report. Only aggregate undeclared counts survive.
+
+Worker settings are queried only for declared public Worker scripts. The collector accepts only the bounded binding types needed for topology reconciliation. Secret-text bindings and all unsupported provider binding payloads are discarded.
+
+The topology report can produce findings including:
+
+- `declared-but-not-observed`;
+- `observed-but-undeclared` as a redacted aggregate;
+- `route-owner-drift`;
+- `missing-service-binding`;
+- `unexpected-service-binding`;
+- `metadata-identity-mismatch`;
+- `missing-storage`;
+- `orphaned-storage`;
+- `observed-state-unavailable`.
+
+No remediation path exists. A finding cannot deploy, delete, bind, unbind, archive, edit DNS, change routes, modify Pages, or mutate storage.
+
+The manual topology workflow intentionally reuses the existing `CF_RESOURCE_AUDIT_READ_TOKEN` secret name. A live topology run requires that token to have the additional provider read permissions needed for Worker scripts/settings, Worker routes, Pages projects, and zone discovery. Changing token permissions is a separate approved provider action and is not performed by this repository change.
+
 ## Report semantics
 
-A healthy report means every declared public resource was observed exactly as declared and the observation contained no duplicate provider identity.
+A healthy storage report means every declared public storage resource was observed exactly as declared and the observation contained no duplicate provider identity.
 
-The report includes:
+A healthy topology report means every declared public Worker and Pages project was observed, declared routes and bindings matched, and each available metadata endpoint identified the expected public service.
 
-- total declared resources;
-- declared present and missing counts;
-- total observed counts by resource kind;
-- undeclared observed counts by resource kind;
-- public identity and owner for declared resources;
-- explicit findings for missing declared resources or duplicate provider identities.
+An unavailable binding or metadata observation is represented as unavailable. It is never silently converted to healthy evidence.
 
-It intentionally does not include names, IDs, metadata, or inferred ownership for undeclared provider resources.
+Both report families intentionally omit names, IDs, metadata, or inferred ownership for undeclared provider objects.
 
 ## Security boundary
 
-The collector performs `GET` requests only. There is no provider write, delete, deploy, route, DNS, restore, or remediation path in this repository.
+Collectors perform `GET` requests only. There is no provider write, delete, deploy, route, DNS, restore, or remediation path in this repository.
 
-Observed provider entries are reduced immediately to:
+Storage observations are reduced immediately to:
 
 ```json
 {
@@ -156,11 +185,11 @@ Observed provider entries are reduced immediately to:
 }
 ```
 
-The reconciliation layer may emit that identity only when it already appears in the canonical public Atlas Infra declaration. Tests assert that an undeclared provider ID cannot appear in either the JSON report or Markdown summary, including duplicate-observation failure paths.
+Topology observations retain declared public identities only. Tests inject private-looking Worker, route, and Pages identities plus secret-text binding payloads and assert that they cannot appear in retained topology evidence.
 
 ## How it fits into Atlas Systems
 
-[`atlas-infra`](https://github.com/AtlasReaper311/atlas-infra) owns the public resource declaration and validates ownership; this repository performs the separate observed-state check. The result complements repository conformance and backup assurance without giving the auditor authority to repair Cloudflare state.
+[`atlas-infra`](https://github.com/AtlasReaper311/atlas-infra) owns the public storage and topology declarations and validates their ownership; this repository performs the separate observed-state checks. The result gives Atlas Trace a bounded live-evidence source without giving the auditor authority to repair Cloudflare state.
 
 An infrastructure audit should be able to prove that declared public resources exist without turning provider visibility into publication authority.
 
