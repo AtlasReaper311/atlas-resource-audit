@@ -129,10 +129,12 @@ def audit(declared: dict[str, Any], observed: dict[str, Any]) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     declared_results: list[dict[str, Any]] = []
     declared_keys: set[tuple[str, str]] = set()
+    declared_by_key: dict[tuple[str, str], dict[str, Any]] = {}
 
     for item in declared_resources:
         key = _resource_key(item)
         declared_keys.add(key)
+        declared_by_key[key] = item
         present = key in observed_key_set
         owner = item["owner"]
         result = {
@@ -160,15 +162,30 @@ def audit(declared: dict[str, Any], observed: dict[str, Any]) -> dict[str, Any]:
             )
 
     for kind, provider_id in duplicate_observed:
+        key = (kind, provider_id)
+        declared_item = declared_by_key.get(key)
+        if declared_item is not None:
+            resource = {
+                "kind": kind,
+                "display_label": declared_item["display_label"],
+                "publicly_declared": True,
+            }
+            summary = (
+                f"Declared public resource {kind}/{declared_item['display_label']} "
+                "was returned more than once by the provider observation."
+            )
+        else:
+            resource = {"kind": kind, "publicly_declared": False}
+            summary = (
+                "An undeclared provider identity was returned more than once. "
+                "Its identity is redacted because undeclared resources may be private."
+            )
         findings.append(
             {
                 "severity": "error",
                 "type": "duplicate-provider-identity",
-                "resource": {
-                    "kind": kind,
-                    "provider_id": provider_id,
-                },
-                "summary": "Cloudflare observation returned one provider identity more than once.",
+                "resource": resource,
+                "summary": summary,
             }
         )
 
