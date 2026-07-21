@@ -87,6 +87,14 @@ The value is never committed or passed through chat. The Cloudflare token should
 
 If the secret is absent, the live step fails closed with an explicit configuration error rather than running a fixture-only audit and presenting it as live evidence.
 
+### Disabled provider features
+
+Provider capability is interpreted against the canonical declaration, not treated as a reason to enable unused products.
+
+Cloudflare R2 error `10042` (`NotEntitled`) is accepted as an empty R2 observation only when the checked-out Atlas Infra declaration contains no `r2-bucket` resources. If any public R2 bucket is declared, or if the collector is run without declaration context, the same provider response remains a hard failure.
+
+This keeps the audit fail-closed for resources Atlas Systems claims to own while allowing an intentionally unused Cloudflare product to remain disabled.
+
 ## Usage
 
 Run deterministic tests locally:
@@ -102,6 +110,7 @@ For an operator collection, check out `atlas-infra` beside this repository and d
 export CLOUDFLARE_ACCOUNT_ID="$(python3 -c 'import json; print(json.load(open("../atlas-infra/policy/public-cloudflare-resources.json", encoding="utf-8"))["account_id"])')"
 test -n "${CLOUDFLARE_API_TOKEN:-}"
 python3 -m atlas_resource_audit.cloudflare_collect \
+  --declared ../atlas-infra/policy/public-cloudflare-resources.json \
   --out /tmp/cloudflare-observed.json
 ```
 
