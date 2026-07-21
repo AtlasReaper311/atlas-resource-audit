@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from atlas_resource_audit.cloudflare_collect import (
+    CloudflareAPIError,
     CloudflareError,
     as_resource,
     collect_observed_state,
@@ -113,6 +114,60 @@ class CloudflareCollectTests(unittest.TestCase):
         self.assertNotIn("private-b", serialized)
         self.assertNotIn("private-d1", serialized)
         self.assertNotIn("private-metadata", serialized)
+
+    @patch("atlas_resource_audit.cloudflare_collect.r2_bucket_results")
+    @patch("atlas_resource_audit.cloudflare_collect.paged_array_results")
+    def test_disabled_r2_is_empty_when_no_r2_bucket_is_declared(
+        self, paged_array_results_mock, r2_bucket_results_mock
+    ) -> None:
+        paged_array_results_mock.side_effect = [[], []]
+        r2_bucket_results_mock.side_effect = CloudflareAPIError(
+            "/accounts/account/r2/buckets",
+            [{"code": 10042, "message": "Please enable R2 through the Cloudflare Dashboard."}],
+            http_status=403,
+        )
+
+        document = collect_observed_state(
+            "account",
+            "token",
+            declared_kinds={"kv-namespace"},
+        )
+
+        self.assertEqual([], document["resources"])
+
+    @patch("atlas_resource_audit.cloudflare_collect.r2_bucket_results")
+    @patch("atlas_resource_audit.cloudflare_collect.paged_array_results")
+    def test_disabled_r2_fails_when_r2_bucket_is_declared(
+        self, paged_array_results_mock, r2_bucket_results_mock
+    ) -> None:
+        paged_array_results_mock.side_effect = [[], []]
+        r2_bucket_results_mock.side_effect = CloudflareAPIError(
+            "/accounts/account/r2/buckets",
+            [{"code": 10042, "message": "Please enable R2 through the Cloudflare Dashboard."}],
+            http_status=403,
+        )
+
+        with self.assertRaises(CloudflareAPIError):
+            collect_observed_state(
+                "account",
+                "token",
+                declared_kinds={"r2-bucket"},
+            )
+
+    @patch("atlas_resource_audit.cloudflare_collect.r2_bucket_results")
+    @patch("atlas_resource_audit.cloudflare_collect.paged_array_results")
+    def test_disabled_r2_fails_without_declaration_context(
+        self, paged_array_results_mock, r2_bucket_results_mock
+    ) -> None:
+        paged_array_results_mock.side_effect = [[], []]
+        r2_bucket_results_mock.side_effect = CloudflareAPIError(
+            "/accounts/account/r2/buckets",
+            [{"code": 10042, "message": "Please enable R2 through the Cloudflare Dashboard."}],
+            http_status=403,
+        )
+
+        with self.assertRaises(CloudflareAPIError):
+            collect_observed_state("account", "token")
 
 
 if __name__ == "__main__":
