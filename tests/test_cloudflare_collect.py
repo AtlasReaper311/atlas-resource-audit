@@ -7,6 +7,8 @@ from atlas_resource_audit.cloudflare_collect import (
     CloudflareError,
     as_resource,
     collect_observed_state,
+    paged_array_results,
+    r2_bucket_results,
 )
 
 
@@ -35,21 +37,60 @@ class CloudflareCollectTests(unittest.TestCase):
         with self.assertRaises(CloudflareError):
             as_resource("kv-namespace", {"title": "no-stable-id"})
 
-    @patch("atlas_resource_audit.cloudflare_collect.paged_results")
+    @patch("atlas_resource_audit.cloudflare_collect.request_json")
+    def test_page_based_pagination_uses_total_count(self, request_json) -> None:
+        request_json.side_effect = [
+            {
+                "success": True,
+                "result": [{"id": "one"}, {"id": "two"}],
+                "result_info": {"page": 1, "per_page": 2, "total_count": 3},
+            },
+            {
+                "success": True,
+                "result": [{"id": "three"}],
+                "result_info": {"page": 2, "per_page": 2, "total_count": 3},
+            },
+        ]
+        results = paged_array_results("/fixture", "token", per_page=2)
+        self.assertEqual([{"id": "one"}, {"id": "two"}, {"id": "three"}], results)
+        self.assertEqual(2, request_json.call_count)
+
+    @patch("atlas_resource_audit.cloudflare_collect.request_json")
+    def test_r2_cursor_pagination_reads_bucket_object(self, request_json) -> None:
+        request_json.side_effect = [
+            {
+                "success": True,
+                "result": {"buckets": [{"name": "bucket-a"}]},
+                "result_info": {"cursor": "next-page"},
+            },
+            {
+                "success": True,
+                "result": {"buckets": [{"name": "bucket-b"}]},
+                "result_info": {},
+            },
+        ]
+        results = r2_bucket_results("/fixture", "token")
+        self.assertEqual([{"name": "bucket-a"}, {"name": "bucket-b"}], results)
+        self.assertEqual("next-page", request_json.call_args_list[1].args[2]["cursor"])
+
+    @patch("atlas_resource_audit.cloudflare_collect.r2_bucket_results")
+    @patch("atlas_resource_audit.cloudflare_collect.paged_array_results")
     @patch(
         "atlas_resource_audit.cloudflare_collect.utc_now",
         return_value="2026-07-21T12:00:00Z",
     )
     def test_collect_observed_state_is_sorted_and_minimal(
-        self, _utc_now, paged_results
+        self, _utc_now, paged_array_results_mock, r2_bucket_results_mock
     ) -> None:
-        paged_results.side_effect = [
+        paged_array_results_mock.side_effect = [
             [
                 {"id": "kv-b", "title": "private-b"},
                 {"id": "kv-a", "title": "private-a"},
             ],
             [{"uuid": "d1-a", "name": "private-d1"}],
-            [{"name": "bucket-a", "creation_date": "private-metadata"}],
+        ]
+        r2_bucket_results_mock.return_value = [
+            {"name": "bucket-a", "creation_date": "private-metadata"}
         ]
         document = collect_observed_state("account", "token")
         self.assertEqual(
