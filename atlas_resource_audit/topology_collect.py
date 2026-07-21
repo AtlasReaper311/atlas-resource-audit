@@ -88,7 +88,12 @@ def _paged_projects(path: str, token: str) -> list[dict[str, Any]]:
 
 
 def _safe_binding(binding: dict[str, Any]) -> dict[str, Any] | None:
-    """Reduce one Worker binding to non-secret topology fields only."""
+    """Reduce one Worker binding to non-secret topology fields only.
+
+    The result is still transient. `collect_observed_topology` retains a full
+    binding identity only when that exact identity is already in the public
+    declaration. Unexpected binding identities are reduced again to counts.
+    """
     binding_type = binding.get("type")
     name = binding.get("name")
     if binding_type not in SAFE_BINDING_TYPES or not isinstance(name, str):
@@ -165,6 +170,20 @@ def _metadata(url: str) -> dict[str, Any]:
     return result
 
 
+def _expected_binding_keys(worker: dict[str, Any]) -> set[tuple[str, str, str]]:
+    expected: set[tuple[str, str, str]] = set()
+    for binding in worker.get("service_bindings", []):
+        if isinstance(binding, dict):
+            expected.add(("service", str(binding.get("binding")), str(binding.get("service"))))
+    for binding in worker.get("storage_bindings", []):
+        if not isinstance(binding, dict):
+            continue
+        target = binding.get("provider_id") or binding.get("class_name")
+        if isinstance(target, str):
+            expected.add((str(binding.get("kind")), str(binding.get("binding")), target))
+    return expected
+
+
 def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str, Any]:
     account_id = declared.get("account_id")
     zone_id = declared.get("zone_id")
@@ -193,13 +212,25 @@ def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str,
         item.get("name") for item in pages if isinstance(item.get("name"), str)
     }
 
-    routes_for_public: dict[str, list[str]] = {name: [] for name in declared_workers}
+    expected_route_sets = {
+        script: {
+            route["pattern"]
+            for route in worker.get("routes", [])
+            if isinstance(route, dict) and isinstance(route.get("pattern"), str)
+        }
+        for script, worker in declared_workers.items()
+    }
+    observed_expected_routes: dict[str, list[str]] = {name: [] for name in declared_workers}
+    unexpected_route_counts: dict[str, int] = {name: 0 for name in declared_workers}
     undeclared_route_count = 0
     for route in routes:
         script = route.get("script")
         pattern = route.get("pattern")
         if script in declared_workers and isinstance(pattern, str):
-            routes_for_public[script].append(pattern)
+            if pattern in expected_route_sets[script]:
+                observed_expected_routes[script].append(pattern)
+            else:
+                unexpected_route_counts[script] += 1
         else:
             undeclared_route_count += 1
 
@@ -207,18 +238,34 @@ def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str,
     for script, item in sorted(declared_workers.items()):
         present = script in observed_script_names
         bindings_state = "not-observed"
-        bindings: list[dict[str, Any]] = []
+        retained_bindings: list[dict[str, Any]] = []
+        unexpected_binding_counts = {"service": 0, "storage": 0}
         metadata = {"state": "not-observed"}
         if present:
-            bindings_state, bindings = _settings_bindings(account_id, script, token)
+            bindings_state, transient_bindings = _settings_bindings(account_id, script, token)
+            if bindings_state == "observed":
+                expected_binding_keys = _expected_binding_keys(item)
+                for binding in transient_bindings:
+                    key = (binding["kind"], binding["binding"], binding["target"])
+                    if key in expected_binding_keys:
+                        retained_bindings.append(binding)
+                    elif binding["kind"] == "service":
+                        unexpected_binding_counts["service"] += 1
+                    else:
+                        unexpected_binding_counts["storage"] += 1
             metadata = _metadata(item["metadata_url"])
         workers.append(
             {
                 "script_name": script,
                 "observed": present,
-                "routes": sorted(set(routes_for_public.get(script, []))),
+                "routes": sorted(set(observed_expected_routes.get(script, []))),
+                "unexpected_route_count": unexpected_route_counts.get(script, 0),
                 "bindings_state": bindings_state,
-                "bindings": bindings,
+                "bindings": sorted(
+                    retained_bindings,
+                    key=lambda binding: (binding["kind"], binding["binding"], binding["target"]),
+                ),
+                "unexpected_binding_counts": unexpected_binding_counts,
                 "metadata": metadata,
             }
         )
@@ -237,6 +284,8 @@ def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str,
         "privacy": {
             "model": "declared-public-identities-plus-aggregate-undeclared-counts",
             "raw_provider_payload_retained": False,
+            "unexpected_route_identities_retained": False,
+            "unexpected_binding_identities_retained": False,
         },
         "aggregate_counts": {
             "workers_total": len(observed_script_names),
