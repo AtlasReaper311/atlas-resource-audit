@@ -59,6 +59,7 @@ class TopologyTests(unittest.TestCase):
             [{"id": "atlas-api-public"}, {"id": "private-worker-secret"}],
             [
                 {"script": "atlas-api-public", "pattern": "api.atlas-systems.uk/v1*"},
+                {"script": "atlas-api-public", "pattern": "private-route.example.invalid/*"},
                 {"script": "private-worker-secret", "pattern": "private.example.invalid/*"},
             ],
         ]
@@ -71,6 +72,8 @@ class TopologyTests(unittest.TestCase):
             [
                 {"binding": "REGISTRY", "kind": "service", "target": "atlas-api-index"},
                 {"binding": "ATLAS_PUBLIC_KV", "kind": "kv-namespace", "target": "public-kv"},
+                {"binding": "PRIVATE_SERVICE", "kind": "service", "target": "private-target-worker"},
+                {"binding": "PRIVATE_KV", "kind": "kv-namespace", "target": "private-kv-id"},
             ],
         )
         metadata.return_value = {
@@ -82,13 +85,28 @@ class TopologyTests(unittest.TestCase):
 
         document = collect_observed_topology(self.declared(), "token")
         serialized = json.dumps(document, sort_keys=True)
-        self.assertNotIn("private-worker-secret", serialized)
-        self.assertNotIn("private.example.invalid", serialized)
-        self.assertNotIn("private-pages-project", serialized)
+        for private_value in (
+            "private-worker-secret",
+            "private.example.invalid",
+            "private-route.example.invalid",
+            "private-pages-project",
+            "private-target-worker",
+            "private-kv-id",
+            "PRIVATE_SERVICE",
+            "PRIVATE_KV",
+        ):
+            self.assertNotIn(private_value, serialized)
         self.assertEqual(1, document["aggregate_counts"]["workers_undeclared"])
         self.assertEqual(1, document["aggregate_counts"]["routes_undeclared_or_private"])
         self.assertEqual(1, document["aggregate_counts"]["pages_undeclared"])
+        self.assertEqual(1, document["workers"][0]["unexpected_route_count"])
+        self.assertEqual(
+            {"service": 1, "storage": 1},
+            document["workers"][0]["unexpected_binding_counts"],
+        )
         self.assertFalse(document["privacy"]["raw_provider_payload_retained"])
+        self.assertFalse(document["privacy"]["unexpected_route_identities_retained"])
+        self.assertFalse(document["privacy"]["unexpected_binding_identities_retained"])
 
     def test_secret_binding_payload_is_never_reduced_to_output(self) -> None:
         self.assertIsNone(
@@ -111,6 +129,8 @@ class TopologyTests(unittest.TestCase):
             "privacy": {
                 "model": "declared-public-identities-plus-aggregate-undeclared-counts",
                 "raw_provider_payload_retained": False,
+                "unexpected_route_identities_retained": False,
+                "unexpected_binding_identities_retained": False,
             },
             "aggregate_counts": {
                 "workers_total": 1,
@@ -125,11 +145,13 @@ class TopologyTests(unittest.TestCase):
                     "script_name": "atlas-api-public",
                     "observed": True,
                     "routes": ["api.atlas-systems.uk/v1*"],
+                    "unexpected_route_count": 0,
                     "bindings_state": "observed",
                     "bindings": [
                         {"binding": "REGISTRY", "kind": "service", "target": "atlas-api-index"},
                         {"binding": "ATLAS_PUBLIC_KV", "kind": "kv-namespace", "target": "public-kv"},
                     ],
+                    "unexpected_binding_counts": {"service": 0, "storage": 0},
                     "metadata": {
                         "state": "observed",
                         "name": "atlas-api-public",
@@ -167,20 +189,20 @@ class TopologyTests(unittest.TestCase):
         report = reconcile(self.declared(), observed)
         self.assertIn("missing-service-binding", {item["type"] for item in report["findings"]})
 
-    def test_unexpected_binding_is_warning(self) -> None:
+    def test_unexpected_binding_is_warning_without_identity(self) -> None:
         observed = self.observed()
-        observed["workers"][0]["bindings"].append(
-            {"binding": "EXTRA", "kind": "service", "target": "atlas-notify"}
-        )
+        observed["workers"][0]["unexpected_binding_counts"]["service"] = 1
         report = reconcile(self.declared(), observed)
         self.assertEqual("warning", report["workers"][0]["state"])
         self.assertIn("unexpected-service-binding", {item["type"] for item in report["findings"]})
+        self.assertIn("identities are redacted", json.dumps(report))
 
-    def test_route_drift_fails(self) -> None:
+    def test_route_drift_fails_without_unexpected_route_identity(self) -> None:
         observed = self.observed()
-        observed["workers"][0]["routes"] = ["api.atlas-systems.uk/wrong*"]
+        observed["workers"][0]["unexpected_route_count"] = 1
         report = reconcile(self.declared(), observed)
         self.assertIn("route-owner-drift", {item["type"] for item in report["findings"]})
+        self.assertIn("unexpected identities redacted", json.dumps(report))
 
     def test_metadata_identity_mismatch_fails(self) -> None:
         observed = self.observed()
