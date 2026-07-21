@@ -83,7 +83,7 @@ The workflow needs one GitHub Actions secret name:
 CF_RESOURCE_AUDIT_READ_TOKEN
 ```
 
-The value is never committed or passed through chat. The Cloudflare token should have only the account-level read permissions required to list the approved resource families: KV storage read, D1 read, and R2 read. It does not need Worker deployment, route mutation, DNS mutation, storage write, or delete permissions.
+The value is never committed or passed through chat. The Cloudflare token should grant only the account-level permissions needed by the collector: `Workers KV Storage Read`, `D1 Read`, and `Workers R2 Storage Read`. It does not need Worker deployment, route mutation, DNS mutation, storage write, or delete permissions.
 
 If the secret is absent, the live step fails closed with an explicit configuration error rather than running a fixture-only audit and presenting it as live evidence.
 
@@ -96,16 +96,18 @@ python3 -m compileall -q atlas_resource_audit tests
 python3 -m unittest discover -s tests -v
 ```
 
-Collect provider state with the credential supplied through the environment:
+For an operator collection, check out `atlas-infra` beside this repository and derive the public account ID from policy:
 
 ```bash
-export CLOUDFLARE_ACCOUNT_ID="<public account id>"
-export CLOUDFLARE_API_TOKEN="<read-only token>"
+export CLOUDFLARE_ACCOUNT_ID="$(python3 -c 'import json; print(json.load(open("../atlas-infra/policy/public-cloudflare-resources.json", encoding="utf-8"))["account_id"])')"
+test -n "${CLOUDFLARE_API_TOKEN:-}"
 python3 -m atlas_resource_audit.cloudflare_collect \
   --out /tmp/cloudflare-observed.json
 ```
 
-Run reconciliation against a checked-out Atlas Infra policy:
+Supply `CLOUDFLARE_API_TOKEN` through the approved local secret-injection method before running that command. Do not place the token in source, shell history, command arguments, chat, or issue text.
+
+Run reconciliation against the checked-out Atlas Infra policy:
 
 ```bash
 python3 -m atlas_resource_audit \
@@ -145,7 +147,7 @@ Observed provider entries are reduced immediately to:
 }
 ```
 
-The reconciliation layer may emit that identity only when it already appears in the canonical public Atlas Infra declaration. Tests assert that an undeclared provider ID cannot appear in either the JSON report or Markdown summary.
+The reconciliation layer may emit that identity only when it already appears in the canonical public Atlas Infra declaration. Tests assert that an undeclared provider ID cannot appear in either the JSON report or Markdown summary, including duplicate-observation failure paths.
 
 ## How it fits into Atlas Systems
 
