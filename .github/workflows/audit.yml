@@ -1,8 +1,10 @@
 name: resource-audit
+
 on:
   workflow_dispatch:
   schedule:
-    - cron: "23 7 * * 1"
+    - cron: "41 7 * * 1"
+
 permissions:
   contents: read
 
@@ -13,9 +15,72 @@ concurrency:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0, Node 24
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0, Node 24
-        with: {python-version: "3.13"}
-      - run: python -m unittest discover -s tests -v
+      - name: Check out resource auditor
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0, Node 24
+
+      - name: Check out canonical Atlas Infra policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0, Node 24
+        with:
+          repository: AtlasReaper311/atlas-infra
+          ref: main
+          path: atlas-infra-policy
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0, Node 24
+        with:
+          python-version: "3.13"
+
+      - name: Validate deterministic audit engine
+        run: |
+          python -m compileall -q atlas_resource_audit tests
+          python -m unittest discover -s tests -v
+
+      - name: Collect Cloudflare state and reconcile public resources
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_RESOURCE_AUDIT_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          DECLARED="atlas-infra-policy/policy/public-cloudflare-resources.json"
+          OBSERVED="${RUNNER_TEMP}/cloudflare-observed.json"
+
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::Missing CF_RESOURCE_AUDIT_READ_TOKEN. Configure a read-only Cloudflare token before running the live audit."
+            exit 1
+          fi
+
+          ACCOUNT_ID="$(python -c 'import json; print(json.load(open("atlas-infra-policy/policy/public-cloudflare-resources.json", encoding="utf-8"))["account_id"])')"
+          export CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID"
+
+          mkdir -p reports
+          trap 'rm -f "$OBSERVED"' EXIT
+
+          python -m atlas_resource_audit.cloudflare_collect \
+            --out "$OBSERVED"
+
+          set +e
+          python -m atlas_resource_audit \
+            --declared "$DECLARED" \
+            --observed "$OBSERVED" \
+            --json-out reports/resource-audit.json \
+            --markdown-out reports/resource-audit.md
+          AUDIT_STATUS=$?
+          set -e
+
+          if [ -f reports/resource-audit.md ]; then
+            cat reports/resource-audit.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          exit "$AUDIT_STATUS"
+
+      - name: Upload sanitized audit report
+        if: always() && hashFiles('reports/**') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1, Node 24
+        with:
+          name: public-resource-audit-${{ github.run_id }}
+          path: reports
+          if-no-files-found: error
+          retention-days: 30

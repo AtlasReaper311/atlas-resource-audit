@@ -1,8 +1,0 @@
-{
-  "specular-telemetry": [
-    {
-      "kind": "kv-namespace",
-      "resource": "telemetry-kv"
-    }
-  ]
-}

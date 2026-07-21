@@ -1,6 +1,8 @@
-
 # Local operator evidence
-bindings.json
 cloudflare-observed.json
 resource-audit.json
 resource-audit.md
+reports/
+
+# Optional local checkout of the canonical policy repository
+atlas-infra-policy/
