@@ -1,0 +1,84 @@
+name: topology-audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.repository }}-topology-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out topology auditor
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0, Node 24
+
+      - name: Check out exact Atlas Infra topology authority
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0, Node 24
+        with:
+          repository: AtlasReaper311/atlas-infra
+          ref: a7d5a123ab04cef0ffb4f509fa41e43af5e5941d
+          path: atlas-infra-policy
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0, Node 24
+        with:
+          python-version: "3.13"
+
+      - name: Validate deterministic topology engine
+        run: |
+          set -euo pipefail
+          python -m compileall -q atlas_resource_audit tests
+          python -m unittest discover -s tests -v
+
+      - name: Collect and reconcile declared public topology
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_RESOURCE_AUDIT_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          DECLARED="atlas-infra-policy/policy/public-cloudflare-topology.json"
+          OBSERVED="${RUNNER_TEMP}/cloudflare-topology-observed.json"
+
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::Missing CF_RESOURCE_AUDIT_READ_TOKEN. Configure the approved read-only Cloudflare audit token before a live topology run."
+            exit 1
+          fi
+
+          mkdir -p reports
+          trap 'rm -f "$OBSERVED"' EXIT
+
+          python -m atlas_resource_audit.topology_collect \
+            --declared "$DECLARED" \
+            --out "$OBSERVED"
+
+          set +e
+          python -m atlas_resource_audit.topology_reconcile \
+            --declared "$DECLARED" \
+            --observed "$OBSERVED" \
+            --json-out reports/topology-audit.json \
+            --markdown-out reports/topology-audit.md
+          AUDIT_STATUS=$?
+          set -e
+
+          if [ -f reports/topology-audit.md ]; then
+            cat reports/topology-audit.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          exit "$AUDIT_STATUS"
+
+      - name: Upload sanitized topology report
+        if: always() && hashFiles('reports/topology-audit.*') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1, Node 24
+        with:
+          name: public-topology-audit-${{ github.run_id }}
+          path: |
+            reports/topology-audit.json
+            reports/topology-audit.md
+          if-no-files-found: error
+          retention-days: 30
