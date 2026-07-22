@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import call, patch
 
+from atlas_resource_audit.cloudflare_collect import CloudflareError
 from atlas_resource_audit.topology_collect import _paged_projects
 
 
@@ -87,7 +88,7 @@ class PagesPaginationTests(unittest.TestCase):
             "result_info": {"total_pages": 0},
         }
 
-        with self.assertRaisesRegex(ValueError, "total_pages"):
+        with self.assertRaisesRegex(CloudflareError, "total_pages"):
             _paged_projects("/accounts/account/pages/projects", "token")
 
 
