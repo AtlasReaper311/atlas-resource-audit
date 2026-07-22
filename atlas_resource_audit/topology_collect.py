@@ -101,6 +101,12 @@ def _paged_projects(path: str, token: str) -> list[dict[str, Any]]:
         return projects
 
 
+def _paged_domains(path: str, token: str) -> list[dict[str, Any]]:
+    """Collect Worker Custom Domains with the same provider pagination contract."""
+
+    return _paged_projects(path, token)
+
+
 def _safe_binding(binding: dict[str, Any]) -> dict[str, Any] | None:
     """Reduce one Worker binding to non-secret topology fields only.
 
@@ -108,6 +114,7 @@ def _safe_binding(binding: dict[str, Any]) -> dict[str, Any] | None:
     binding identity only when that exact identity is already in the public
     declaration. Unexpected binding identities are reduced again to counts.
     """
+
     binding_type = binding.get("type")
     name = binding.get("name")
     if binding_type not in SAFE_BINDING_TYPES or not isinstance(name, str):
@@ -140,7 +147,11 @@ def _safe_binding(binding: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _settings_bindings(account_id: str, script: str, token: str) -> tuple[str, list[dict[str, Any]]]:
+def _settings_bindings(
+    account_id: str,
+    script: str,
+    token: str,
+) -> tuple[str, list[dict[str, Any]]]:
     path = f"/accounts/{account_id}/workers/scripts/{script}/settings"
     try:
         payload = request_json(path, token)
@@ -166,13 +177,21 @@ def _settings_bindings(account_id: str, script: str, token: str) -> tuple[str, l
 def _metadata(url: str) -> dict[str, Any]:
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json", "User-Agent": "AtlasReaper311/atlas-resource-audit"},
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "AtlasReaper311/atlas-resource-audit",
+        },
         method="GET",
     )
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+    except (
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ):
         return {"state": "unavailable"}
     if not isinstance(payload, dict):
         return {"state": "unavailable"}
@@ -188,17 +207,52 @@ def _expected_binding_keys(worker: dict[str, Any]) -> set[tuple[str, str, str]]:
     expected: set[tuple[str, str, str]] = set()
     for binding in worker.get("service_bindings", []):
         if isinstance(binding, dict):
-            expected.add(("service", str(binding.get("binding")), str(binding.get("service"))))
+            expected.add(
+                (
+                    "service",
+                    str(binding.get("binding")),
+                    str(binding.get("service")),
+                )
+            )
     for binding in worker.get("storage_bindings", []):
         if not isinstance(binding, dict):
             continue
         target = binding.get("provider_id") or binding.get("class_name")
         if isinstance(target, str):
-            expected.add((str(binding.get("kind")), str(binding.get("binding")), target))
+            expected.add(
+                (
+                    str(binding.get("kind")),
+                    str(binding.get("binding")),
+                    target,
+                )
+            )
     return expected
 
 
-def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str, Any]:
+def _declared_custom_domains(
+    declared_workers: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    domains: dict[str, str] = {}
+    for script, worker in declared_workers.items():
+        for route in worker.get("routes", []):
+            if not isinstance(route, dict) or route.get("custom_domain") is not True:
+                continue
+            hostname = route.get("pattern")
+            if not isinstance(hostname, str) or not hostname:
+                raise CloudflareError(f"{script}: custom domain must have a hostname")
+            existing = domains.get(hostname)
+            if existing is not None and existing != script:
+                raise CloudflareError(
+                    f"custom domain {hostname} is declared for multiple Workers"
+                )
+            domains[hostname] = script
+    return domains
+
+
+def collect_observed_topology(
+    declared: dict[str, Any],
+    token: str,
+) -> dict[str, Any]:
     account_id = declared.get("account_id")
     zone_id = declared.get("zone_id")
     if not isinstance(account_id, str) or not isinstance(zone_id, str):
@@ -218,6 +272,12 @@ def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str,
         for item in declared["pages_projects"]
         if isinstance(item, dict) and isinstance(item.get("project_name"), str)
     }
+    declared_domains = _declared_custom_domains(declared_workers)
+    domains = (
+        _paged_domains(f"/accounts/{account_id}/workers/domains", token)
+        if declared_domains
+        else []
+    )
 
     observed_script_names = {
         item.get("id") for item in scripts if isinstance(item.get("id"), str)
@@ -234,9 +294,14 @@ def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str,
         }
         for script, worker in declared_workers.items()
     }
-    observed_expected_routes: dict[str, list[str]] = {name: [] for name in declared_workers}
-    unexpected_route_counts: dict[str, int] = {name: 0 for name in declared_workers}
+    observed_expected_routes: dict[str, list[str]] = {
+        name: [] for name in declared_workers
+    }
+    unexpected_route_counts: dict[str, int] = {
+        name: 0 for name in declared_workers
+    }
     undeclared_route_count = 0
+
     for route in routes:
         script = route.get("script")
         pattern = route.get("pattern")
@@ -248,6 +313,24 @@ def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str,
         else:
             undeclared_route_count += 1
 
+    for domain in domains:
+        hostname = domain.get("hostname")
+        service = domain.get("service")
+        domain_zone_id = domain.get("zone_id")
+        if not isinstance(hostname, str) or not isinstance(service, str):
+            undeclared_route_count += 1
+            continue
+        expected_script = declared_domains.get(hostname)
+        if (
+            expected_script is not None
+            and service == expected_script
+            and domain_zone_id == zone_id
+        ):
+            observed_expected_routes[expected_script].append(hostname)
+        else:
+            # The hostname or attached service may be private. Retain only a count.
+            undeclared_route_count += 1
+
     workers: list[dict[str, Any]] = []
     for script, item in sorted(declared_workers.items()):
         present = script in observed_script_names
@@ -256,11 +339,19 @@ def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str,
         unexpected_binding_counts = {"service": 0, "storage": 0}
         metadata = {"state": "not-observed"}
         if present:
-            bindings_state, transient_bindings = _settings_bindings(account_id, script, token)
+            bindings_state, transient_bindings = _settings_bindings(
+                account_id,
+                script,
+                token,
+            )
             if bindings_state == "observed":
                 expected_binding_keys = _expected_binding_keys(item)
                 for binding in transient_bindings:
-                    key = (binding["kind"], binding["binding"], binding["target"])
+                    key = (
+                        binding["kind"],
+                        binding["binding"],
+                        binding["target"],
+                    )
                     if key in expected_binding_keys:
                         retained_bindings.append(binding)
                     elif binding["kind"] == "service":
@@ -277,7 +368,11 @@ def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str,
                 "bindings_state": bindings_state,
                 "bindings": sorted(
                     retained_bindings,
-                    key=lambda binding: (binding["kind"], binding["binding"], binding["target"]),
+                    key=lambda binding: (
+                        binding["kind"],
+                        binding["binding"],
+                        binding["target"],
+                    ),
                 ),
                 "unexpected_binding_counts": unexpected_binding_counts,
                 "metadata": metadata,
@@ -303,8 +398,10 @@ def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str,
         },
         "aggregate_counts": {
             "workers_total": len(observed_script_names),
-            "workers_undeclared": len(observed_script_names - set(declared_workers)),
-            "routes_total": len(routes),
+            "workers_undeclared": len(
+                observed_script_names - set(declared_workers)
+            ),
+            "routes_total": len(routes) + len(domains),
             "routes_undeclared_or_private": undeclared_route_count,
             "pages_total": len(observed_page_names),
             "pages_undeclared": len(observed_page_names - set(declared_pages)),
@@ -315,7 +412,9 @@ def collect_observed_topology(declared: dict[str, Any], token: str) -> dict[str,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Collect privacy-safe read-only Cloudflare topology evidence.")
+    parser = argparse.ArgumentParser(
+        description="Collect privacy-safe read-only Cloudflare topology evidence."
+    )
     parser.add_argument("--declared", required=True)
     parser.add_argument("--token", default=os.environ.get("CLOUDFLARE_API_TOKEN"))
     parser.add_argument("--out", required=True)
@@ -329,7 +428,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Cloudflare topology collection failed: {error}", file=sys.stderr)
         return 2
     Path(args.out).write_text(
-        json.dumps(observed, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        json.dumps(observed, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
     print("topology observation written with undeclared identities redacted")
     return 0
