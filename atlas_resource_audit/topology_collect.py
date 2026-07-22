@@ -68,22 +68,36 @@ def _array_result(path: str, token: str) -> list[dict[str, Any]]:
 def _paged_projects(path: str, token: str) -> list[dict[str, Any]]:
     page = 1
     projects: list[dict[str, Any]] = []
+
     while True:
-        payload = request_json(path, token, {"page": str(page), "per_page": "100"})
+        payload = request_json(path, token, {"page": str(page)})
         result = payload.get("result")
         if not isinstance(result, list):
             raise CloudflareError(f"Cloudflare result for {path} was not a list")
+
         projects.extend(item for item in result if isinstance(item, dict))
+
         info = payload.get("result_info") or {}
         if not isinstance(info, dict):
             raise CloudflareError(f"Cloudflare result_info for {path} was not an object")
+
         total_pages = info.get("total_pages")
-        if isinstance(total_pages, int) and page < total_pages:
-            page += 1
-            continue
-        if len(result) == 100 and total_pages is None:
-            page += 1
-            continue
+        if isinstance(total_pages, int):
+            if total_pages < 1:
+                raise CloudflareError(f"Cloudflare total_pages for {path} was invalid")
+            if page < total_pages:
+                page += 1
+                continue
+            return projects
+
+        total_count = info.get("total_count")
+        if isinstance(total_count, int):
+            if total_count < 0:
+                raise CloudflareError(f"Cloudflare total_count for {path} was invalid")
+            if len(projects) < total_count:
+                page += 1
+                continue
+
         return projects
 
 
