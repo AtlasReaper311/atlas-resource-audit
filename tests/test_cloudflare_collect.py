@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
+import urllib.error
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from atlas_resource_audit.cloudflare_collect import (
     CloudflareAPIError,
@@ -9,11 +11,157 @@ from atlas_resource_audit.cloudflare_collect import (
     as_resource,
     collect_observed_state,
     paged_array_results,
+    request_json,
     r2_bucket_results,
 )
 
 
+class FakeResponse:
+    def __init__(self, payload: object) -> None:
+        self.body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self.body
+
+
 class CloudflareCollectTests(unittest.TestCase):
+    def test_timeout_then_success_retries(self) -> None:
+        opener = Mock(
+            side_effect=[TimeoutError("read timed out"), FakeResponse({"success": True})]
+        )
+        sleeps: list[float] = []
+
+        result = request_json(
+            "/fixture",
+            "token-value",
+            opener=opener,
+            sleep_fn=sleeps.append,
+        )
+
+        self.assertEqual({"success": True}, result)
+        self.assertEqual([1.0], sleeps)
+
+    def test_connection_reset_then_success_retries(self) -> None:
+        opener = Mock(
+            side_effect=[
+                urllib.error.URLError(ConnectionResetError("connection reset")),
+                FakeResponse({"success": True}),
+            ]
+        )
+        sleeps: list[float] = []
+
+        result = request_json(
+            "/fixture",
+            "token-value",
+            opener=opener,
+            sleep_fn=sleeps.append,
+        )
+
+        self.assertEqual({"success": True}, result)
+        self.assertEqual([1.0], sleeps)
+
+    def test_http_429_honours_retry_after(self) -> None:
+        attempts = [
+            urllib.error.HTTPError(
+                "https://api.cloudflare.com/client/v4/fixture",
+                429,
+                "rate limited",
+                {"Retry-After": "3"},
+                None,
+            ),
+            FakeResponse({"success": True}),
+        ]
+        sleeps: list[float] = []
+
+        def opener(*_args, **_kwargs):
+            error = attempts.pop(0)
+            if isinstance(error, BaseException):
+                raise error
+            return error
+
+        self.assertEqual(
+            {"success": True},
+            request_json("/fixture", "token-value", opener=opener, sleep_fn=sleeps.append),
+        )
+        self.assertEqual([3.0], sleeps)
+
+    def test_http_5xx_retries(self) -> None:
+        attempts = [
+            urllib.error.HTTPError(
+                "https://api.cloudflare.com/client/v4/fixture",
+                503,
+                "unavailable",
+                {},
+                None,
+            ),
+            FakeResponse({"success": True}),
+        ]
+        sleeps: list[float] = []
+
+        def opener(*_args, **_kwargs):
+            error = attempts.pop(0)
+            if isinstance(error, BaseException):
+                raise error
+            return error
+
+        self.assertEqual(
+            {"success": True},
+            request_json("/fixture", "token-value", opener=opener, sleep_fn=sleeps.append),
+        )
+        self.assertEqual([1.0], sleeps)
+
+    def test_persistent_timeout_stops_after_bounded_attempts(self) -> None:
+        opener = Mock(side_effect=TimeoutError("read timed out"))
+        sleeps: list[float] = []
+
+        with self.assertRaisesRegex(CloudflareError, "after 3 attempt"):
+            request_json("/fixture", "token-value", opener=opener, sleep_fn=sleeps.append)
+
+        self.assertEqual(3, opener.call_count)
+        self.assertEqual([1.0, 2.0], sleeps)
+
+    def test_http_auth_failure_does_not_retry(self) -> None:
+        opener = Mock(
+            side_effect=urllib.error.HTTPError(
+                "https://api.cloudflare.com/client/v4/fixture",
+                401,
+                "unauthorized",
+                {"Retry-After": "3"},
+                None,
+            )
+        )
+
+        with self.assertRaises(CloudflareError):
+            request_json("/fixture", "token-value", opener=opener, sleep_fn=lambda _: None)
+
+        self.assertEqual(1, opener.call_count)
+
+    def test_malformed_successful_response_is_not_retried(self) -> None:
+        opener = Mock()
+        opener.return_value = FakeResponse(["not", "an", "object"])
+
+        with self.assertRaisesRegex(CloudflareError, "was not an object"):
+            request_json("/fixture", "token-value", opener=opener, sleep_fn=lambda _: None)
+
+        self.assertEqual(1, opener.call_count)
+
+    def test_token_is_redacted_from_provider_error(self) -> None:
+        token = "sensitive-token-value"
+        opener = Mock(
+            side_effect=urllib.error.URLError(f"connection failed for {token}")
+        )
+
+        with self.assertRaises(CloudflareError) as caught:
+            request_json("/fixture", token, opener=opener, sleep_fn=lambda _: None)
+
+        self.assertNotIn(token, str(caught.exception))
+
     def test_as_resource_emits_minimum_identity_only(self) -> None:
         resource = as_resource(
             "kv-namespace",

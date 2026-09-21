@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import errno
+from collections.abc import Callable
+from email.utils import parsedate_to_datetime
 import json
 import os
+import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +21,18 @@ from typing import Any
 API_BASE = "https://api.cloudflare.com/client/v4"
 OBSERVED_SCHEMA_VERSION = "atlas-resource-audit/observed-cloudflare/v2"
 R2_NOT_ENTITLED_CODE = 10042
+REQUEST_TIMEOUT_SECONDS = 30
+MAX_REQUEST_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 1.0
+MAX_RETRY_DELAY_SECONDS = 8.0
+RETRYABLE_HTTP_STATUS_CODES = {408, 429}
+TRANSIENT_ERRNOS = {
+    errno.ECONNABORTED,
+    errno.ECONNREFUSED,
+    errno.ECONNRESET,
+    errno.ETIMEDOUT,
+    errno.EPIPE,
+}
 
 
 class CloudflareError(RuntimeError):
@@ -62,9 +79,65 @@ def _structured_errors(payload: Any) -> list[dict[str, Any]]:
     return [error for error in errors if isinstance(error, dict)]
 
 
+def _redact_value(value: Any, token: str) -> Any:
+    """Remove the bearer token from provider error material before reporting."""
+
+    if isinstance(value, str):
+        return value.replace(token, "<redacted>") if token else value
+    if isinstance(value, dict):
+        return {key: _redact_value(item, token) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_value(item, token) for item in value]
+    return value
+
+
+def _redact_text(value: str, token: str) -> str:
+    return value.replace(token, "<redacted>") if token else value
+
+
+def _is_transient_network_error(error: BaseException) -> bool:
+    if isinstance(error, (TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    return isinstance(error, OSError) and error.errno in TRANSIENT_ERRNOS
+
+
+def _retry_delay(headers: Any, attempt: int) -> float:
+    """Return a bounded Retry-After delay or exponential fallback."""
+
+    retry_after = headers.get("Retry-After") if headers is not None else None
+    if retry_after:
+        try:
+            delay = max(0.0, float(retry_after))
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                delay = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+    else:
+        delay = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+    return min(delay, MAX_RETRY_DELAY_SECONDS)
+
+
+def _retryable_http_status(status: int) -> bool:
+    return status in RETRYABLE_HTTP_STATUS_CODES or 500 <= status <= 599
+
+
 def request_json(
-    path: str, token: str, query: dict[str, str] | None = None
+    path: str,
+    token: str,
+    query: dict[str, str] | None = None,
+    *,
+    opener: Callable[..., Any] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    max_attempts: int = MAX_REQUEST_ATTEMPTS,
 ) -> dict[str, Any]:
+    """GET one Cloudflare endpoint with bounded transient retry handling."""
+
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
     url = f"{API_BASE}{path}"
     if query:
         url = f"{url}?{urllib.parse.urlencode(query)}"
@@ -77,39 +150,65 @@ def request_json(
         },
         method="GET",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
+    open_url = opener or urllib.request.urlopen
+    sleep = sleep_fn or time.sleep
+    for attempt in range(1, max_attempts + 1):
         try:
-            payload = json.loads(detail)
-        except json.JSONDecodeError:
-            payload = None
-        errors = _structured_errors(payload)
-        if errors:
-            raise CloudflareAPIError(
-                path,
-                errors,
-                http_status=error.code,
+            with open_url(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                body = response.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as error:
+            detail = _redact_text(
+                error.read().decode("utf-8", errors="replace"), token
+            )
+            if _retryable_http_status(error.code) and attempt < max_attempts:
+                sleep(_retry_delay(error.headers, attempt))
+                continue
+            try:
+                payload = json.loads(detail)
+            except json.JSONDecodeError:
+                payload = None
+            errors = _redact_value(_structured_errors(payload), token)
+            if errors:
+                raise CloudflareAPIError(
+                    path,
+                    errors,
+                    http_status=error.code,
+                ) from error
+            raise CloudflareError(
+                f"Cloudflare HTTP {error.code} for {path}: {detail[:500]}"
             ) from error
-        raise CloudflareError(
-            f"Cloudflare HTTP {error.code} for {path}: {detail[:500]}"
-        ) from error
-    except urllib.error.URLError as error:
-        raise CloudflareError(
-            f"Cloudflare request failed for {path}: {error.reason}"
-        ) from error
+        except urllib.error.URLError as error:
+            if _is_transient_network_error(error.reason) and attempt < max_attempts:
+                sleep(_retry_delay(None, attempt))
+                continue
+            reason = _redact_text(str(error.reason), token)
+            raise CloudflareError(
+                f"Cloudflare request failed for {path} after {attempt} attempt(s): {reason}"
+            ) from error
+        except OSError as error:
+            if _is_transient_network_error(error) and attempt < max_attempts:
+                sleep(_retry_delay(None, attempt))
+                continue
+            reason = _redact_text(str(error), token)
+            raise CloudflareError(
+                f"Cloudflare request failed for {path} after {attempt} attempt(s): {reason}"
+            ) from error
+    else:
+        raise AssertionError("request retry loop completed without a result")
     try:
         payload = json.loads(body)
     except json.JSONDecodeError as error:
         raise CloudflareError(f"Cloudflare returned invalid JSON for {path}") from error
+    if not isinstance(payload, dict):
+        raise CloudflareError(f"Cloudflare response for {path} was not an object")
     if not payload.get("success", False):
-        errors = _structured_errors(payload)
+        errors = _redact_value(_structured_errors(payload), token)
         if errors:
             raise CloudflareAPIError(path, errors)
+        failure_detail = _redact_value(payload.get("errors", []), token)
         raise CloudflareError(
-            f"Cloudflare API reported failure for {path}: {payload.get('errors', [])}"
+            f"Cloudflare API reported failure for {path}: {failure_detail}"
         )
     return payload
 
